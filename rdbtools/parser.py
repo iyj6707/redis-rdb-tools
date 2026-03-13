@@ -52,6 +52,13 @@ REDIS_RDB_TYPE_ZSET_ZIPLIST = 12
 REDIS_RDB_TYPE_HASH_ZIPLIST = 13
 REDIS_RDB_TYPE_LIST_QUICKLIST = 14
 REDIS_RDB_TYPE_STREAM_LISTPACKS = 15
+REDIS_RDB_TYPE_HASH_LISTPACK = 16
+REDIS_RDB_TYPE_ZSET_LISTPACK = 17
+REDIS_RDB_TYPE_LIST_QUICKLIST_2 = 18
+REDIS_RDB_TYPE_SET_LISTPACK = 19
+REDIS_RDB_TYPE_STREAM_LISTPACKS_2 = 20
+REDIS_RDB_TYPE_SET_LISTPACK_EX = 21
+REDIS_RDB_TYPE_HASH_LISTPACK_EX = 22
 
 REDIS_RDB_ENC_INT8 = 0
 REDIS_RDB_ENC_INT16 = 1
@@ -588,6 +595,20 @@ class RdbParser(object):
             self.read_module(f)
         elif enc_type == REDIS_RDB_TYPE_STREAM_LISTPACKS:
             self.read_stream(f)
+        elif enc_type == REDIS_RDB_TYPE_HASH_LISTPACK:
+            self.read_hash_from_listpack(f)
+        elif enc_type == REDIS_RDB_TYPE_ZSET_LISTPACK:
+            self.read_zset_from_listpack(f)
+        elif enc_type == REDIS_RDB_TYPE_LIST_QUICKLIST_2:
+            self.read_list_from_quicklist2(f)
+        elif enc_type == REDIS_RDB_TYPE_SET_LISTPACK:
+            self.read_set_from_listpack(f)
+        elif enc_type == REDIS_RDB_TYPE_STREAM_LISTPACKS_2:
+            self.read_stream_v2(f)
+        elif enc_type == REDIS_RDB_TYPE_SET_LISTPACK_EX:
+            self.read_set_from_listpack(f)
+        elif enc_type == REDIS_RDB_TYPE_HASH_LISTPACK_EX:
+            self.read_hash_from_listpack(f)
         else:
             raise Exception('read_object', 'Invalid object type %d for key %s' % (enc_type, self._key))
 
@@ -657,6 +678,17 @@ class RdbParser(object):
             self.skip_module(f)
         elif enc_type == REDIS_RDB_TYPE_STREAM_LISTPACKS:
             self.skip_stream(f)
+        elif enc_type in (REDIS_RDB_TYPE_HASH_LISTPACK, REDIS_RDB_TYPE_ZSET_LISTPACK,
+                          REDIS_RDB_TYPE_SET_LISTPACK, REDIS_RDB_TYPE_SET_LISTPACK_EX,
+                          REDIS_RDB_TYPE_HASH_LISTPACK_EX):
+            skip_strings = 1
+        elif enc_type == REDIS_RDB_TYPE_LIST_QUICKLIST_2:
+            count = self.read_length(f)
+            for _i in range(count):
+                self.read_length(f)  # container type
+                self.skip_string(f)
+        elif enc_type == REDIS_RDB_TYPE_STREAM_LISTPACKS_2:
+            self.skip_stream_v2(f)
         else:
             raise Exception('skip_object', 'Invalid object type %d for key %s' % (enc_type, self._key))
         for x in range(0, skip_strings):
@@ -871,6 +903,282 @@ class RdbParser(object):
             iowrapper.stop_recording()
         self._callback.end_module(self._key, buffer_size=iowrapper.get_recorded_size(), buffer=buffer)
 
+    def read_listpack_entry(self, f):
+        """Read a single entry from a listpack buffer.
+
+        Listpack encoding (see Redis src/listpack.c):
+        - 7-bit uint:    0xxxxxxx + backlen
+        - 6-bit string:  10xxxxxx + <data> + backlen
+        - 13-bit int:    110xxxxx xxxxxxxx + backlen
+        - 16-bit string: 01000000 xxxxxxxx xxxxxxxx + <data> + backlen
+        - 32-bit string: 01100000 <4 bytes len> + <data> + backlen
+        - 16-bit int:    11100001 <2 bytes> + backlen
+        - 24-bit int:    11100010 <3 bytes> + backlen
+        - 32-bit int:    11100011 <4 bytes> + backlen
+        - 64-bit int:    11100100 <8 bytes> + backlen
+        - EOF:           11111111
+        """
+        b = f.read(1)
+        if not b:
+            return None
+        entry_header = b[0]
+
+        if entry_header == 0xFF:
+            return None
+
+        if (entry_header & 0x80) == 0:
+            # 7-bit unsigned int
+            val = entry_header & 0x7F
+            f.read(1)  # backlen
+            return val
+        elif (entry_header & 0xC0) == 0x80:
+            # 6-bit string
+            length = entry_header & 0x3F
+            val = f.read(length)
+            f.read(1)  # backlen
+            return val
+        elif (entry_header & 0xE0) == 0xC0:
+            # 13-bit signed int
+            next_byte = f.read(1)[0]
+            val = ((entry_header & 0x1F) << 8) | next_byte
+            if val >= 4096:
+                val -= 8192
+            f.read(1)  # backlen
+            return val
+        elif entry_header == 0x40:
+            # 16-bit length string
+            b1 = f.read(1)[0]
+            b2 = f.read(1)[0]
+            length = (b2 << 8) | b1
+            val = f.read(length)
+            self._skip_listpack_backlen(f, length + 3)
+            return val
+        elif entry_header == 0x60:
+            # 32-bit length string
+            length = struct.unpack('<I', f.read(4))[0]
+            val = f.read(length)
+            self._skip_listpack_backlen(f, length + 5)
+            return val
+        elif entry_header == 0xE1:
+            # 16-bit signed int
+            val = struct.unpack('<h', f.read(2))[0]
+            f.read(1)  # backlen
+            return val
+        elif entry_header == 0xE2:
+            # 24-bit signed int
+            b = f.read(3)
+            val = b[0] | (b[1] << 8) | (b[2] << 16)
+            if val >= (1 << 23):
+                val -= (1 << 24)
+            f.read(1)  # backlen
+            return val
+        elif entry_header == 0xE3:
+            # 32-bit signed int
+            val = struct.unpack('<i', f.read(4))[0]
+            f.read(1)  # backlen
+            return val
+        elif entry_header == 0xE4:
+            # 64-bit signed int
+            val = struct.unpack('<q', f.read(8))[0]
+            f.read(1)  # backlen
+            return val
+        else:
+            # Unknown sub-encoding, return raw byte
+            f.read(1)  # backlen
+            return entry_header
+
+    def _skip_listpack_backlen(self, f, entry_size):
+        """Skip the variable-length backlen field at the end of a listpack entry."""
+        if entry_size < 128:
+            f.read(1)
+        elif entry_size < 16384:
+            f.read(2)
+        elif entry_size < 2097152:
+            f.read(3)
+        elif entry_size < 268435456:
+            f.read(4)
+        else:
+            f.read(5)
+
+    def _read_listpack_header(self, raw_string):
+        """Parse listpack header: total_bytes (uint32) + num_entries (uint16)."""
+        buff = BytesIO(raw_string)
+        total_bytes = struct.unpack('<I', buff.read(4))[0]
+        num_entries = struct.unpack('<H', buff.read(2))[0]
+        return buff, num_entries
+
+    def read_hash_from_listpack(self, f):
+        """Read hash encoded as listpack (RDB type 16/22)."""
+        raw_string = self.read_string(f)
+        buff, num_entries = self._read_listpack_header(raw_string)
+        num_pairs = num_entries // 2
+        self._callback.start_hash(self._key, num_pairs, self._expiry,
+                                  info={'encoding': 'listpack', 'sizeof_value': len(raw_string),
+                                        'idle': self._idle, 'freq': self._freq})
+        for _ in range(num_pairs):
+            try:
+                key = self.read_listpack_entry(buff)
+                value = self.read_listpack_entry(buff)
+                if key is not None and value is not None:
+                    self._callback.hset(self._key, key, value)
+            except Exception:
+                break
+        self._callback.end_hash(self._key)
+
+    def read_zset_from_listpack(self, f):
+        """Read sorted set encoded as listpack (RDB type 17)."""
+        raw_string = self.read_string(f)
+        buff, num_entries = self._read_listpack_header(raw_string)
+        num_pairs = num_entries // 2
+        self._callback.start_sorted_set(self._key, num_pairs, self._expiry,
+                                        info={'encoding': 'listpack', 'sizeof_value': len(raw_string),
+                                              'idle': self._idle, 'freq': self._freq})
+        for _ in range(num_pairs):
+            try:
+                member = self.read_listpack_entry(buff)
+                score = self.read_listpack_entry(buff)
+                if member is not None:
+                    try:
+                        score = float(score) if score is not None else 0.0
+                    except (ValueError, TypeError):
+                        score = 0.0
+                    self._callback.zadd(self._key, score, member)
+            except Exception:
+                break
+        self._callback.end_sorted_set(self._key)
+
+    def read_set_from_listpack(self, f):
+        """Read set encoded as listpack (RDB type 19/21)."""
+        raw_string = self.read_string(f)
+        buff, num_entries = self._read_listpack_header(raw_string)
+        self._callback.start_set(self._key, num_entries, self._expiry,
+                                 info={'encoding': 'listpack', 'sizeof_value': len(raw_string),
+                                       'idle': self._idle, 'freq': self._freq})
+        for _ in range(num_entries):
+            try:
+                member = self.read_listpack_entry(buff)
+                if member is not None:
+                    self._callback.sadd(self._key, member)
+            except Exception:
+                break
+        self._callback.end_set(self._key)
+
+    def read_list_from_quicklist2(self, f):
+        """Read list encoded as quicklist v2 with listpack nodes (RDB type 18)."""
+        count = self.read_length(f)
+        total_size = 0
+        self._callback.start_list(self._key, self._expiry,
+                                  info={'encoding': 'quicklist2', 'zips': count,
+                                        'idle': self._idle, 'freq': self._freq})
+        for _ in range(count):
+            container = self.read_length(f)  # 1=PLAIN, 2=PACKED (listpack)
+            raw_string = self.read_string(f)
+            total_size += len(raw_string)
+            if container == 2:
+                # PACKED: listpack encoded node
+                try:
+                    buff, lp_num = self._read_listpack_header(raw_string)
+                    for _ in range(lp_num):
+                        entry = self.read_listpack_entry(buff)
+                        if entry is not None:
+                            self._callback.rpush(self._key, entry)
+                except Exception:
+                    pass  # skip corrupt node, continue with next
+            else:
+                # PLAIN: raw string value
+                self._callback.rpush(self._key, raw_string)
+        self._callback.end_list(self._key, info={'encoding': 'quicklist2', 'zips': count, 'sizeof_value': total_size})
+
+    def read_stream_v2(self, f):
+        """Read stream encoded as STREAM_LISTPACKS_2 (RDB type 20).
+
+        Similar to v1 but with additional fields:
+        - first_entry_id, max_deleted_entry_id, entries_added in stream metadata
+        - entries_read in consumer group metadata
+        - active_time in consumer metadata
+        """
+        listpacks = self.read_length(f)
+        self._callback.start_stream(self._key, listpacks, self._expiry,
+                                    info={'encoding': 'listpack', 'idle': self._idle, 'freq': self._freq})
+        for _lp in range(listpacks):
+            self._callback.stream_listpack(self._key, self.read_string(f), self.read_string(f))
+
+        items = self.read_length(f)
+        last_entry_id = "%s-%s" % (self.read_length(f), self.read_length(f))
+        first_entry_id = "%s-%s" % (self.read_length(f), self.read_length(f))       # v2 addition
+        max_deleted_entry_id = "%s-%s" % (self.read_length(f), self.read_length(f))  # v2 addition
+        entries_added = self.read_length(f)                                           # v2 addition
+
+        cgroups = self.read_length(f)
+        cgroups_data = []
+        for _cg in range(cgroups):
+            cgname = self.read_string(f)
+            last_cg_entry_id = "%s-%s" % (self.read_length(f), self.read_length(f))
+            entries_read = self.read_length(f)  # v2 addition
+            pending = self.read_length(f)
+            group_pending_entries = []
+            for _pel in range(pending):
+                eid = f.read(16)
+                delivery_time = read_milliseconds_time(f)
+                delivery_count = self.read_length(f)
+                group_pending_entries.append({'id': eid,
+                                              'delivery_time': delivery_time,
+                                              'delivery_count': delivery_count})
+            consumers = self.read_length(f)
+            consumers_data = []
+            for _c in range(consumers):
+                cname = self.read_string(f)
+                seen_time = read_milliseconds_time(f)
+                active_time = read_milliseconds_time(f)  # v2 addition
+                pending = self.read_length(f)
+                consumer_pending_entries = []
+                for _pel in range(pending):
+                    eid = f.read(16)
+                    consumer_pending_entries.append({'id': eid})
+                consumers_data.append({'name': cname,
+                                       'seen_time': seen_time,
+                                       'pending': consumer_pending_entries})
+            cgroups_data.append({'name': cgname,
+                                 'last_entry_id': last_cg_entry_id,
+                                 'pending': group_pending_entries,
+                                 'consumers': consumers_data})
+        self._callback.end_stream(self._key, items, last_entry_id, cgroups_data)
+
+    def skip_stream_v2(self, f):
+        """Skip STREAM_LISTPACKS_2 format (RDB type 20)."""
+        listpacks = self.read_length(f)
+        for _lp in range(listpacks):
+            self.skip_string(f)  # master ID
+            self.skip_string(f)  # listpack blob
+        # stream metadata (v2 has more fields than v1)
+        self.read_length(f)  # items
+        self.read_length(f)  # last_entry_id ms
+        self.read_length(f)  # last_entry_id seq
+        self.read_length(f)  # first_entry_id ms
+        self.read_length(f)  # first_entry_id seq
+        self.read_length(f)  # max_deleted_entry_id ms
+        self.read_length(f)  # max_deleted_entry_id seq
+        self.read_length(f)  # entries_added
+        # consumer groups
+        cgroups = self.read_length(f)
+        for _cg in range(cgroups):
+            self.skip_string(f)  # group name
+            self.read_length(f)  # last_id ms
+            self.read_length(f)  # last_id seq
+            self.read_length(f)  # entries_read (v2 addition)
+            pending = self.read_length(f)
+            for _pel in range(pending):
+                f.read(16)   # entry ID
+                f.read(8)    # delivery time
+                self.read_length(f)  # delivery count
+            consumers = self.read_length(f)
+            for _c in range(consumers):
+                self.skip_string(f)  # consumer name
+                f.read(8)   # seen time
+                f.read(8)   # active time (v2 addition)
+                pending = self.read_length(f)
+                f.read(pending * 16)  # pending entry IDs
+
     def skip_stream(self, f):
         listpacks = self.read_length(f)
         for _lp in range(listpacks):
@@ -959,7 +1267,7 @@ class RdbParser(object):
 
     def verify_version(self, version_str) :
         version = int(version_str)
-        if version < 1 or version > 9:
+        if version < 1 or version > 12:
             raise Exception('verify_version', 'Invalid RDB version number %d' % version)
         self._rdb_version = version
 
